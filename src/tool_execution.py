@@ -415,6 +415,172 @@ async def _direct_fallback(
                 return {"error": f"write_file: {path}: {e}", "exit_code": 1}
             return {"output": f"Wrote {size} bytes to {path}", "exit_code": 0}
 
+        if tool in ("workspace_write", "workspace_read", "workspace_list", "workspace_delete"):
+            # Scoped filesystem tools — files live under data/workspace/<project>/
+            # and are reachable at http://<host>:<port>/workspace/<project>/.
+            # Arguments arrive as JSON (function-calling) or as line-based
+            # fallback to mirror write_file's parser.
+            import os as _os
+            from pathlib import Path as _Path
+
+            WORKSPACE_ROOT = _Path(_os.path.abspath(_os.path.join("data", "workspace")))
+            MAX_WS_FILE_BYTES = 2 * 1024 * 1024  # 2 MB per file
+
+            raw = (content or "").strip()
+            args: Dict[str, str] = {}
+            if raw.startswith("{"):
+                try:
+                    parsed = _json.loads(raw)
+                    if isinstance(parsed, dict):
+                        args = {k: ("" if v is None else str(v)) for k, v in parsed.items()}
+                except _json.JSONDecodeError:
+                    pass
+            if not args:
+                # Line-based fallback: line1=project, line2=path, rest=body
+                lines = raw.split("\n", 2)
+                args["project"] = lines[0].strip() if lines else ""
+                if len(lines) > 1:
+                    args["path"] = lines[1].strip()
+                if len(lines) > 2:
+                    args["content"] = lines[2]
+
+            def _sanitize_project(name: str) -> Optional[str]:
+                n = (name or "").strip().lower()
+                if not n:
+                    return None
+                # Allow letters, digits, dash, underscore, dot (but not leading dot)
+                import re as _re
+                if not _re.match(r"^[a-z0-9][a-z0-9._-]{0,63}$", n):
+                    return None
+                if n in (".", "..") or n.startswith("."):
+                    return None
+                return n
+
+            def _resolve_under(root: _Path, rel: str) -> Optional[_Path]:
+                """Resolve `rel` under `root`, rejecting traversal and symlinks."""
+                if rel is None:
+                    rel = ""
+                # Strip leading slashes so the agent can pass "/index.html"
+                rel = str(rel).lstrip("/").lstrip("\\")
+                # Reject any path component that is "..", starts with ".", or is empty
+                for part in _Path(rel).parts:
+                    if part in ("", ".", ".."):
+                        return None
+                    if part.startswith("."):
+                        return None
+                try:
+                    target = (root / rel).resolve()
+                    root_resolved = root.resolve()
+                except (OSError, RuntimeError):
+                    return None
+                if root_resolved != target and root_resolved not in target.parents:
+                    return None
+                # Reject if any ancestor (within root) is a symlink
+                p = target
+                while p != root_resolved and p != p.parent:
+                    if p.is_symlink():
+                        return None
+                    p = p.parent
+                return target
+
+            WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
+            project = _sanitize_project(args.get("project", ""))
+
+            if tool == "workspace_list":
+                # No project → list all projects with file counts
+                if not project:
+                    projects = []
+                    try:
+                        for entry in sorted(WORKSPACE_ROOT.iterdir()):
+                            if entry.is_dir() and not entry.name.startswith("."):
+                                n_files = sum(1 for _ in entry.rglob("*") if _.is_file())
+                                projects.append(f"{entry.name}/  ({n_files} files)")
+                    except OSError as e:
+                        return {"error": f"workspace_list: {e}", "exit_code": 1}
+                    if not projects:
+                        return {"output": "No workspace projects yet.", "exit_code": 0}
+                    return {"output": "Projects:\n" + "\n".join(projects), "exit_code": 0}
+                proj_dir = WORKSPACE_ROOT / project
+                if not proj_dir.exists():
+                    return {"error": f"workspace_list: project '{project}' not found", "exit_code": 1}
+                rows = []
+                for f in sorted(proj_dir.rglob("*")):
+                    if f.is_file() and not any(p.startswith(".") for p in f.relative_to(proj_dir).parts):
+                        rel = f.relative_to(proj_dir).as_posix()
+                        rows.append(f"{rel}  ({f.stat().st_size} bytes)")
+                if not rows:
+                    return {"output": f"Project '{project}' is empty.", "exit_code": 0}
+                return {"output": f"{project}/\n" + "\n".join(rows), "exit_code": 0}
+
+            # Remaining tools all need a valid project
+            if not project:
+                return {"error": f"{tool}: invalid or missing 'project' (use kebab-case, e.g. 'my-site')", "exit_code": 1}
+            proj_dir = WORKSPACE_ROOT / project
+
+            if tool == "workspace_write":
+                rel = args.get("path", "")
+                body = args.get("content", "")
+                if not rel:
+                    return {"error": "workspace_write: 'path' required", "exit_code": 1}
+                if len(body.encode("utf-8", errors="ignore")) > MAX_WS_FILE_BYTES:
+                    return {"error": f"workspace_write: content exceeds {MAX_WS_FILE_BYTES} bytes", "exit_code": 1}
+                proj_dir.mkdir(parents=True, exist_ok=True)
+                target = _resolve_under(proj_dir, rel)
+                if target is None:
+                    return {"error": f"workspace_write: invalid path '{rel}' (traversal or hidden component blocked)", "exit_code": 1}
+                try:
+                    def _write():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with open(target, "w", encoding="utf-8") as f:
+                            f.write(body)
+                        return len(body)
+                    size = await asyncio.to_thread(_write)
+                except OSError as e:
+                    return {"error": f"workspace_write: {e}", "exit_code": 1}
+                url = f"/workspace/{project}/{target.relative_to(proj_dir).as_posix()}"
+                return {"output": f"Wrote {size} bytes to {project}/{target.relative_to(proj_dir).as_posix()}\nPreview: {url}", "exit_code": 0}
+
+            if tool == "workspace_read":
+                rel = args.get("path", "")
+                if not rel:
+                    return {"error": "workspace_read: 'path' required", "exit_code": 1}
+                target = _resolve_under(proj_dir, rel)
+                if target is None or not target.exists():
+                    return {"error": f"workspace_read: {project}/{rel}: not found", "exit_code": 1}
+                if not target.is_file():
+                    return {"error": f"workspace_read: {project}/{rel}: not a file", "exit_code": 1}
+                try:
+                    def _read():
+                        with open(target, "r", encoding="utf-8", errors="replace") as f:
+                            return f.read(MAX_READ_CHARS + 1)
+                    data = await asyncio.to_thread(_read)
+                except OSError as e:
+                    return {"error": f"workspace_read: {e}", "exit_code": 1}
+                if len(data) > MAX_READ_CHARS:
+                    data = data[:MAX_READ_CHARS] + f"\n... [truncated at {MAX_READ_CHARS} chars]"
+                return {"output": data, "exit_code": 0}
+
+            if tool == "workspace_delete":
+                rel = args.get("path", "")
+                if not rel:
+                    # Delete the whole project folder
+                    if not proj_dir.exists():
+                        return {"error": f"workspace_delete: project '{project}' not found", "exit_code": 1}
+                    try:
+                        import shutil as _shutil
+                        await asyncio.to_thread(_shutil.rmtree, proj_dir)
+                    except OSError as e:
+                        return {"error": f"workspace_delete: {e}", "exit_code": 1}
+                    return {"output": f"Deleted project '{project}'", "exit_code": 0}
+                target = _resolve_under(proj_dir, rel)
+                if target is None or not target.exists():
+                    return {"error": f"workspace_delete: {project}/{rel}: not found", "exit_code": 1}
+                try:
+                    await asyncio.to_thread(target.unlink)
+                except OSError as e:
+                    return {"error": f"workspace_delete: {e}", "exit_code": 1}
+                return {"output": f"Deleted {project}/{rel}", "exit_code": 0}
+
         if tool == "web_search":
             from src.search import comprehensive_web_search
             raw = content.strip()

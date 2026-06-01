@@ -347,6 +347,16 @@ class _RevalidatingStatic(StaticFiles):
 
 app.mount("/static", _RevalidatingStatic(directory="static"), name="static")
 
+# ========= AGENT WORKSPACE =========
+# Files the agent writes via the workspace_* tools land under data/workspace
+# and are served here so multi-file projects (HTML + CSS + JS, small static
+# sites, etc.) work with real relative paths. Owner-only since APP_BIND
+# defaults to 127.0.0.1. html=True serves index.html for folder URLs.
+import os as _os
+_WORKSPACE_DIR = _os.path.abspath(_os.path.join("data", "workspace"))
+_os.makedirs(_WORKSPACE_DIR, exist_ok=True)
+app.mount("/workspace", StaticFiles(directory=_WORKSPACE_DIR, html=True), name="workspace")
+
 # ========= GENERATED IMAGES =========
 @app.get("/api/generated-image/{filename}")
 async def serve_generated_image(filename: str, request: Request):

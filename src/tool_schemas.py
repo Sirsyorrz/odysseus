@@ -110,8 +110,67 @@ FUNCTION_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "workspace_write",
+            "description": "Write a file inside the agent workspace under a named project folder. PREFERRED tool for any multi-file code project (HTML+CSS+JS sites, Python packages, anything where files must reference each other). Files live at data/workspace/<project>/<path> on the host and are served at /workspace/<project>/<path> so HTML can link to CSS/JS with normal relative paths. After writing the entry file (index.html, etc.) tell the user to open http://localhost:7000/workspace/<project>/ to preview. Use the same project name across related files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Short kebab-case folder name for this project (e.g. 'portfolio-site', 'todo-app'). All related files share one project name."},
+                    "path":    {"type": "string", "description": "Relative path inside the project folder (e.g. 'index.html', 'css/style.css', 'app.js'). Must not escape the project folder."},
+                    "content": {"type": "string", "description": "Full file content."}
+                },
+                "required": ["project", "path", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace_read",
+            "description": "Read a file from the agent workspace. Use to inspect or modify existing project files written via workspace_write.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project folder name."},
+                    "path":    {"type": "string", "description": "Relative path inside the project folder."}
+                },
+                "required": ["project", "path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace_list",
+            "description": "List files in a workspace project folder, or list all projects when project is omitted. Returns paths and sizes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project folder name. Omit to list all projects."}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace_delete",
+            "description": "Delete a file from a workspace project, or the entire project folder when path is omitted.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project folder name."},
+                    "path":    {"type": "string", "description": "Relative path inside the project. Omit to delete the whole project folder."}
+                },
+                "required": ["project"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "create_document",
-            "description": "Create a new document in the editor panel. ALWAYS use this when the user asks to write, create, build, or generate code, scripts, programs, games, apps, or any substantial content (>15 lines). NEVER put large code blocks directly in chat — use this tool instead.",
+            "description": "Create a new document in the editor panel. Use this for SELF-CONTAINED single-file content: notes, articles, one-file scripts, single Python/JS files, markdown, etc. For MULTI-FILE PROJECTS where files must reference each other (HTML linking to CSS/JS, Python with imports, anything previewable), use workspace_write instead — those files live on disk in a shared folder, so relative paths actually work. NEVER put large code blocks directly in chat.",
             "parameters": {
                 "type": "object",
                 "properties": {
